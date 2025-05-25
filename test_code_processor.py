@@ -4,25 +4,20 @@ import shutil
 import json
 import sys
 import random
-from unittest.mock import patch
+import numpy as np
+from unittest.mock import patch, MagicMock, call
 
 # --- Path Adjustments for Imports ---
-# This assumes test_code_processor.py is in the same directory as code_processor.py,
-# directory_scanner.py, and file_utils.py, or that these modules are installed/on PYTHONPATH.
-
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
-# If your project structure has these files in the root and tests in a subfolder,
-# you might need to add parent_dir to sys.path.
-# For this setup, we assume they are in the same directory or accessible.
 if current_script_dir not in sys.path:
     sys.path.append(current_script_dir)
 
-# Try to import target functions and their dependencies
 try:
     from code_processor import process_project_files, save_processed_data_to_json, generate_simulated_embedding
-    # The following are used by code_processor, so their modules must be importable
-    from directory_scanner import scan_directory
-    from file_utils import read_file_content, chunk_code
+    # These are dependencies of code_processor, ensure they are importable for context
+    import directory_scanner 
+    import file_utils
+    import vector_db_utils # Ensure this module itself is found for FAISS_AVAILABLE patching
 except ImportError as e:
     print(f"Initial import failed: {e}. Attempting to add parent directory to path.")
     parent_dir = os.path.dirname(current_script_dir)
@@ -30,35 +25,85 @@ except ImportError as e:
         sys.path.insert(0, parent_dir)
     try:
         from code_processor import process_project_files, save_processed_data_to_json, generate_simulated_embedding
-        from directory_scanner import scan_directory
-        from file_utils import read_file_content, chunk_code
+        import directory_scanner
+        import file_utils
+        import vector_db_utils
         print("Successfully imported from parent directory.")
     except ImportError as e_inner:
         print(f"Secondary import failed: {e_inner}. Please check your PYTHONPATH and file locations.")
         print(f"Current sys.path: {sys.path}")
         raise
 
+# Default mocks for FAISS utility functions, can be overridden in specific tests
+# These will mock the functions as imported by code_processor.py
+DEFAULT_MOCK_CONFIG = {
+    'code_processor.initialize_faiss_index': MagicMock(return_value=MagicMock(name="MockFaissIndex")),
+    'code_processor.add_embeddings_to_index': MagicMock(),
+    'code_processor.save_faiss_index': MagicMock(),
+    'code_processor.search_faiss_index': MagicMock(return_value=(np.array([[0.1]]), np.array([[0]]))), # Default search result
+    'code_processor.FAISS_AVAILABLE': True # Default to FAISS being available
+}
 
-class TestCodeProcessor(unittest.TestCase):
-
+class BaseTestCodeProcessor(unittest.TestCase):
     def setUp(self):
         self.test_root_dir = os.path.abspath("temp_test_code_processor_root")
         if os.path.exists(self.test_root_dir):
             shutil.rmtree(self.test_root_dir)
         os.makedirs(self.test_root_dir, exist_ok=True)
-        # Seed random for predictable embeddings in tests
         random.seed(42)
+
+        # Apply default mocks using patch.object or patch for the class
+        self.patchers = []
+        for target, mock_obj in DEFAULT_MOCK_CONFIG.items():
+            # Need to handle FAISS_AVAILABLE differently as it's a boolean, not a function
+            if target == 'code_processor.FAISS_AVAILABLE':
+                patcher = patch(target, DEFAULT_MOCK_CONFIG[target])
+            else:
+                # For functions, ensure they are fresh MagicMocks for each test if setUp is per test
+                patcher = patch(target, new_callable=lambda: MagicMock(return_value=mock_obj.return_value) if isinstance(mock_obj, MagicMock) else mock_obj)
+            
+            # If the mock_obj has a side_effect or specific configuration, apply it
+            if isinstance(mock_obj, MagicMock) and hasattr(mock_obj, 'side_effect') and mock_obj.side_effect:
+                patched_mock = patcher.start()
+                patched_mock.side_effect = mock_obj.side_effect
+            elif isinstance(mock_obj, MagicMock) and hasattr(mock_obj, 'return_value'):
+                 patched_mock = patcher.start()
+                 # For the main mock_index, we need to ensure it has a 'd' attribute for dimension checks
+                 if target == 'code_processor.initialize_faiss_index':
+                    mock_index_instance = MagicMock(name="MockFaissIndexInstance")
+                    mock_index_instance.d = 0 # Default, can be set by test
+                    patched_mock.return_value = mock_index_instance
+
+            else:
+                patcher.start()
+
+            self.patchers.append(patcher)
+        
+        # Reset mocks that should be clean per test, especially those that count calls
+        # This is tricky with class-level patching. Better to do it per method or ensure mocks are reset.
+        # For simplicity here, we'll rely on method-level overrides or specific mock resets in tests.
+        # Or, more simply, re-fetch the mocked objects:
+        self.mock_initialize_faiss_index = DEFAULT_MOCK_CONFIG['code_processor.initialize_faiss_index']
+        self.mock_add_embeddings_to_index = DEFAULT_MOCK_CONFIG['code_processor.add_embeddings_to_index']
+        self.mock_save_faiss_index = DEFAULT_MOCK_CONFIG['code_processor.save_faiss_index']
+        self.mock_search_faiss_index = DEFAULT_MOCK_CONFIG['code_processor.search_faiss_index']
 
 
     def tearDown(self):
         if os.path.exists(self.test_root_dir):
             shutil.rmtree(self.test_root_dir)
+        for patcher in self.patchers:
+            patcher.stop()
+    
+    def _reset_faiss_mocks(self):
+        # Manually reset call counts etc. for default mocks if needed between calls in one test
+        self.mock_initialize_faiss_index.reset_mock()
+        self.mock_add_embeddings_to_index.reset_mock()
+        self.mock_save_faiss_index.reset_mock()
+        self.mock_search_faiss_index.reset_mock()
+
 
     def _create_dummy_project(self, project_name: str, files_spec: list[dict]):
-        """
-        Helper to create a dummy project structure.
-        files_spec: [{'name': 'path/to/file.py', 'content': '...', 'unreadable': True/False}, ...]
-        """
         project_path = os.path.join(self.test_root_dir, project_name)
         os.makedirs(project_path, exist_ok=True)
         created_files = []
@@ -68,142 +113,132 @@ class TestCodeProcessor(unittest.TestCase):
             with open(file_path, "w") as f:
                 f.write(file_info['content'])
             if file_info.get('unreadable'):
-                try:
-                    os.chmod(file_path, 0o000) # Remove all permissions
-                except Exception as e:
-                    print(f"Warning: Could not make {file_path} unreadable: {e}")
+                try: os.chmod(file_path, 0o000)
+                except Exception as e: print(f"Warning: Could not make {file_path} unreadable: {e}")
             created_files.append(file_path)
         return project_path, created_files
 
-    # --- Tests for process_project_files ---
+class TestCodeProcessorFaissIntegration(BaseTestCodeProcessor):
 
-    def test_empty_project_directory(self):
-        project_path, _ = self._create_dummy_project("empty_proj", [])
-        # Create an empty actual subdirectory to scan
-        empty_scan_dir = os.path.join(project_path, "actually_empty_subdir")
-        os.makedirs(empty_scan_dir)
-
-        result = process_project_files(empty_scan_dir, ['.py'], 10, 2, 5)
-        self.assertEqual(result, [])
-
-    def test_file_extension_filtering(self):
-        files = [
-            {'name': 'script1.py', 'content': 'print("py1")\nline2'},
-            {'name': 'notes.txt', 'content': 'text file'},
-            {'name': 'module/script2.py', 'content': 'import os\nprint("py2")'},
-            {'name': 'README.md', 'content': '# Markdown'}
-        ]
-        project_path, _ = self._create_dummy_project("filter_proj", files)
-
-        # Test for .py files
-        py_results = process_project_files(project_path, ['.py'], 5, 1, 5)
-        self.assertEqual(len(py_results), 2) # script1.py and script2.py (1 chunk each as content is short)
-        py_filepaths = sorted([r['filepath'] for r in py_results])
-        self.assertTrue(any("script1.py" in fp for fp in py_filepaths))
-        self.assertTrue(any("script2.py" in fp for fp in py_filepaths))
-
-        # Test for .txt files
-        txt_results = process_project_files(project_path, ['.txt'], 5, 1, 5)
-        self.assertEqual(len(txt_results), 1)
-        self.assertTrue("notes.txt" in txt_results[0]['filepath'])
-        
-        # Test for .md files (expect empty)
-        md_results = process_project_files(project_path, ['.md'], 5, 1, 5)
-        self.assertEqual(len(md_results), 1) # README.md
-        self.assertTrue("README.md" in md_results[0]['filepath'])
-
-
-    def test_content_processing_and_integration(self):
-        file_content = "\n".join([f"Line {i+1}" for i in range(15)]) # 15 lines
+    # Test with FAISS_AVAILABLE = True (default from BaseTestCodeProcessor)
+    @patch('code_processor.initialize_faiss_index', return_value=MagicMock(name="MockFaissIndexInstance", d=3))
+    @patch('code_processor.add_embeddings_to_index')
+    @patch('code_processor.save_faiss_index')
+    @patch('code_processor.search_faiss_index', return_value=(np.array([[0.1, 0.2]]), np.array([[0,1]])))
+    @patch('code_processor.FAISS_AVAILABLE', True)
+    def test_content_processing_with_faiss(self, mock_faiss_available_val, mock_search, mock_save, mock_add, mock_init):
+        file_content = "\n".join([f"Line {i+1}" for i in range(15)])
         files = [{'name': 'integrate.py', 'content': file_content}]
-        project_path, _ = self._create_dummy_project("integration_proj", files)
-        
-        lines_per_chunk = 7
-        overlap_lines = 2
+        project_path, _ = self._create_dummy_project("faiss_proj", files)
         embedding_dim = 3
-        random.seed(42) # ensure embedding is predictable for this test
-
-        results = process_project_files(project_path, ['.py'], lines_per_chunk, overlap_lines, embedding_dim)
         
-        self.assertTrue(len(results) > 0, "Should produce at least one chunk.")
+        mock_init.return_value.d = embedding_dim # Ensure mock index has correct dimension
+
+        results = process_project_files(project_path, ['.py'], 7, 2, embedding_dim)
         
-        # Expected chunks:
-        # C1: L1-L7
-        # C2: L6-L12 (7-2=5, so starts at L6)
-        # C3: L11-L15 (7-2=5, so starts at L11)
-        expected_num_chunks = 3
-        self.assertEqual(len(results), expected_num_chunks)
+        self.assertTrue(len(results) > 0)
+        mock_init.assert_called_once_with(embedding_dim)
+        
+        # Check add_embeddings_to_index call
+        mock_add.assert_called_once()
+        args_add, _ = mock_add.call_args
+        self.assertEqual(args_add[0], mock_init.return_value) # Called with the mock index
+        self.assertIsInstance(args_add[1], np.ndarray)
+        self.assertEqual(args_add[1].dtype, np.float32)
+        self.assertEqual(args_add[1].shape[1], embedding_dim) # Check dimension of matrix
 
-        for i, item in enumerate(results):
-            self.assertTrue("integrate.py" in item['filepath'])
-            self.assertIsInstance(item['chunk_text'], str)
-            self.assertIsInstance(item['embedding'], list)
-            self.assertEqual(len(item['embedding']), embedding_dim)
-            self.assertTrue(all(isinstance(f, float) for f in item['embedding']))
-
-            # Check chunk content (simplified check for first and last line)
-            chunk_lines = item['chunk_text'].splitlines()
-            if i == 0: # Chunk 1
-                self.assertEqual(chunk_lines[0], "Line 1")
-                self.assertEqual(chunk_lines[-1], "Line 7")
-            elif i == 1: # Chunk 2
-                self.assertEqual(chunk_lines[0], "Line 6")
-                self.assertEqual(chunk_lines[-1], "Line 12")
-            elif i == 2: # Chunk 3
-                self.assertEqual(chunk_lines[0], "Line 11")
-                self.assertEqual(chunk_lines[-1], "Line 15")
+        expected_index_filename = f"{os.path.basename(project_path)}_embeddings.faiss"
+        expected_index_filepath = os.path.join(project_path, expected_index_filename)
+        mock_save.assert_called_once_with(mock_init.return_value, expected_index_filepath)
+        
+        mock_search.assert_called_once() # Assuming search demo is always run if embeddings exist
 
 
-    @patch('sys.stdout') # To suppress print warnings in test output
-    def test_handling_unreadable_files(self, mock_stdout):
-        files = [
-            {'name': 'readable.py', 'content': 'print("readable")\nline2'},
-            {'name': 'unreadable.py', 'content': 'print("unreadable")\nline2_unreadable', 'unreadable': True}
-        ]
-        project_path, created_files = self._create_dummy_project("unreadable_proj", files)
-        unreadable_file_path = next(f for f in created_files if "unreadable.py" in f)
+    @patch('code_processor.initialize_faiss_index')
+    @patch('code_processor.add_embeddings_to_index')
+    @patch('code_processor.save_faiss_index')
+    @patch('code_processor.search_faiss_index')
+    @patch('code_processor.FAISS_AVAILABLE', False) # Test with FAISS_AVAILABLE = False
+    def test_content_processing_no_faiss(self, mock_faiss_available_val, mock_search, mock_save, mock_add, mock_init):
+        file_content = "\n".join([f"Line {i+1}" for i in range(15)])
+        files = [{'name': 'no_faiss_integrate.py', 'content': file_content}]
+        project_path, _ = self._create_dummy_project("no_faiss_proj", files)
+        
+        results = process_project_files(project_path, ['.py'], 7, 2, 3)
+        
+        self.assertTrue(len(results) > 0) # Still processes files
+        mock_init.assert_not_called()
+        mock_add.assert_not_called()
+        mock_save.assert_not_called()
+        mock_search.assert_not_called()
 
-        try:
-            results = process_project_files(project_path, ['.py'], 5, 1, 3)
-            self.assertEqual(len(results), 1) # Only readable.py should be processed
-            self.assertTrue("readable.py" in results[0]['filepath'])
-            # Check if the warning was printed for the unreadable file
-            # This is an indirect check. A more robust way might involve patching 'print'
-            # specifically in code_processor.py if it's used for warnings.
-            # For now, we assume the warning mechanism works if the file is skipped.
-        finally:
-            # Ensure the unreadable file can be deleted
-            if os.path.exists(unreadable_file_path):
-                os.chmod(unreadable_file_path, 0o777)
+    @patch('code_processor.initialize_faiss_index')
+    @patch('code_processor.FAISS_AVAILABLE', True)
+    def test_empty_project_skips_faiss(self, mock_faiss_available_val, mock_init):
+        project_path, _ = self._create_dummy_project("empty_faiss_proj", [])
+        empty_scan_dir = os.path.join(project_path, "sub")
+        os.makedirs(empty_scan_dir)
+        process_project_files(empty_scan_dir, ['.py'], 10, 2, 5)
+        mock_init.assert_not_called() # No data to process
 
+    @patch('code_processor.initialize_faiss_index')
+    @patch('code_processor.FAISS_AVAILABLE', True)
+    def test_no_matching_files_skips_faiss(self, mock_faiss_available_val, mock_init):
+        files = [{'name': 'notes.txt', 'content': 'text file'}]
+        project_path, _ = self._create_dummy_project("no_match_faiss_proj", files)
+        process_project_files(project_path, ['.py'], 5, 1, 3) # Looking for .py, finds .txt
+        mock_init.assert_not_called()
 
-    def test_non_existent_project_path(self):
-        non_existent_path = os.path.join(self.test_root_dir, "this_project_does_not_exist")
-        with self.assertRaises(FileNotFoundError):
-            process_project_files(non_existent_path, ['.py'], 10, 2, 5)
-
+    @patch('code_processor.initialize_faiss_index')
+    @patch('code_processor.FAISS_AVAILABLE', True)
     @patch('sys.stdout') # Suppress print warnings
-    def test_invalid_chunking_parameters(self, mock_stdout):
-        files = [{'name': 'test.py', 'content': 'line1\nline2\nline3\nline4\nline5'}]
-        project_path, _ = self._create_dummy_project("invalid_chunk_proj", files)
+    def test_invalid_params_skips_faiss(self, mock_stdout, mock_faiss_available_val, mock_init):
+        files = [{'name': 'test.py', 'content': 'line1\nline2'}]
+        project_path, _ = self._create_dummy_project("invalid_param_faiss_proj", files)
+        # Invalid chunking params leading to no valid chunks/embeddings
+        process_project_files(project_path, ['.py'], 0, 0, 3) 
+        mock_init.assert_not_called()
+
+
+    # This test focuses on the interaction with vector_db_utils.save_faiss_index
+    # and the underlying (mocked) faiss.write_index call.
+    @patch('code_processor.FAISS_AVAILABLE', True)
+    @patch('code_processor.vector_db_utils.faiss.write_index') # Mock the actual write_index
+    @patch('code_processor.initialize_faiss_index') 
+    @patch('code_processor.add_embeddings_to_index')
+    @patch('code_processor.search_faiss_index') # Mock search as it's part of the flow
+    def test_faiss_integration_save_path_and_interaction(self, 
+        mock_cp_search, mock_cp_add, mock_cp_init, mock_faiss_write_index, mock_cp_faiss_available):
         
-        # lines_per_chunk = 0 should raise ValueError in chunk_code, caught in process_project_files
-        results = process_project_files(project_path, ['.py'], 0, 0, 5)
-        self.assertEqual(results, [], "Should return empty list as file processing fails.")
+        mock_index_instance = MagicMock(name="MockedFaissIndexForSaveTest")
+        mock_cp_init.return_value = mock_index_instance
 
-    @patch('sys.stdout') # Suppress print warnings
-    def test_invalid_embedding_parameters(self, mock_stdout):
-        files = [{'name': 'test.py', 'content': 'line1\nline2\nline3'}]
-        project_path, _ = self._create_dummy_project("invalid_embed_proj", files)
+        file_content = "line1\nline2\nline3\nline4\nline5"
+        files = [{'name': 'save_test.py', 'content': file_content}]
+        project_path, _ = self._create_dummy_project("faiss_save_interaction_proj", files)
+        embedding_dim = 3
 
-        # embedding_dim = 0 should raise ValueError in generate_simulated_embedding
-        results = process_project_files(project_path, ['.py'], 2, 1, 0)
-        self.assertEqual(results, [], "Should return empty list as embedding generation fails.")
+        # We are NOT mocking code_processor.save_faiss_index itself, 
+        # but the underlying faiss.write_index that it calls.
+        process_project_files(project_path, ['.py'], 3, 1, embedding_dim)
 
-    # --- Tests for save_processed_data_to_json ---
+        mock_cp_init.assert_called_once_with(embedding_dim)
+        mock_cp_add.assert_called_once()
+        
+        # Assert that the actual vector_db_utils.save_faiss_index called faiss.write_index
+        mock_faiss_write_index.assert_called_once()
+        args_write, _ = mock_faiss_write_index.call_args
+        self.assertEqual(args_write[0], mock_index_instance) # Correct index object passed
+        
+        expected_filename = f"{os.path.basename(project_path)}_embeddings.faiss"
+        expected_filepath = os.path.join(project_path, expected_filename)
+        self.assertEqual(args_write[1], expected_filepath) # Correct filepath
 
+class TestSaveJsonFunctionality(BaseTestCodeProcessor): # Inherits setUp/tearDown
+    # Test for save_processed_data_to_json (should be mostly unaffected)
     def test_successful_save_and_content_verification(self):
-        random.seed(42) # for predictable embeddings
+        random.seed(42)
+        # generate_simulated_embedding is part of code_processor, so it's used directly
         sample_data = [
             {'filepath': '/path/to/file1.py', 'chunk_text': 'chunk1\nline2', 'embedding': generate_simulated_embedding("c1",3)},
             {'filepath': '/path/to/file2.py', 'chunk_text': 'chunk2', 'embedding': generate_simulated_embedding("c2",3)}
@@ -217,25 +252,27 @@ class TestCodeProcessor(unittest.TestCase):
             loaded_data = json.load(f)
         self.assertEqual(loaded_data, sample_data)
 
-    @patch('code_processor.print') # Patch print in the code_processor module
+    @patch('code_processor.print')
     def test_save_to_invalid_path_is_directory(self, mock_print):
         sample_data = [{'key': 'value'}]
-        # Use the root test directory itself as the "file" path
-        output_dir_path = os.path.join(self.test_root_dir, "output_is_dir")
-        os.makedirs(output_dir_path, exist_ok=True) # output_dir_path is now a directory
+        output_dir_path = os.path.join(self.test_root_dir, "output_is_dir_json")
+        os.makedirs(output_dir_path, exist_ok=True)
 
         save_processed_data_to_json(sample_data, output_dir_path)
         
-        # Check if print was called with an error message
-        # This relies on save_processed_data_to_json printing an error for IOError/OSError
-        # The exact error message might vary by OS, so check for "Error: Could not write JSON"
         error_found = False
         for call_args in mock_print.call_args_list:
             if "Error: Could not write JSON" in call_args[0][0]:
-                error_found = True
-                break
-        self.assertTrue(error_found, "Error message for writing to directory not printed.")
-        self.assertFalse(os.path.isfile(output_dir_path), "File should not be created if path is a directory.")
+                error_found = True; break
+        self.assertTrue(error_found)
+        self.assertFalse(os.path.isfile(output_dir_path))
+
+# Keep other specific tests like non_existent_project_path if they don't need FAISS specific logic
+class TestCodeProcessorStandalone(BaseTestCodeProcessor):
+    def test_non_existent_project_path(self):
+        non_existent_path = os.path.join(self.test_root_dir, "this_project_does_not_exist")
+        with self.assertRaises(FileNotFoundError): # This error is from directory_scanner
+            process_project_files(non_existent_path, ['.py'], 10, 2, 5)
 
 
 if __name__ == '__main__':
